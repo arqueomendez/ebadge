@@ -1,0 +1,19 @@
+[project]
+name = "ebadge"
+version = "0.1.0"
+description = "Python/bleak port of the DG01 LCD badge BLE protocol (BG02/BW03, LJ733) — RU50/ETC2 image upload"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "bleak>=3.0.2",
+    "pillow>=12.3.0",
+    "etcpak>=0.9.15",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

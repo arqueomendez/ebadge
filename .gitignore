@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local captures / payloads (never commit)
+*.pklg
+*.pcap
+*.etl
+*.bin
+payload-*.bin
+ru50-*.bin
+
+# Personal images (keep directory, ignore contents)
+imagen/*
+!imagen/.gitkeep
