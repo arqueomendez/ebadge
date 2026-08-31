@@ -229,7 +229,19 @@ class EBadge:
             pass
 
     def _on_notify(self, _handle, data: bytearray) -> None:
-        for frame in self._asm.push(bytes(data)):
+        raw = bytes(data)
+        # Log EVERY raw notify, regardless of whether anything below
+        # recognizes it -- added 2026-08-31 after discovering this project
+        # had a whole class of frames (short 0xDC acks, see
+        # proto.FRAME_MARKER_DC) it silently dropped with zero trace. Never
+        # go blind to unrecognized bytes like that again.
+        log.debug("<< raw %s", raw.hex())
+        dc = proto.parse_dc_short(raw)
+        if dc is not None:
+            log.debug("<< DC short frame cmd=%d sub=%d: %s", dc[0], dc[1], raw.hex())
+            self._frames.put_nowait(raw)
+            return
+        for frame in self._asm.push(raw):
             log.debug("<< %s", frame.hex())
             self._frames.put_nowait(frame)
 
@@ -371,6 +383,20 @@ class EBadge:
         """
         for _ in range(max_frames):
             frame = await self._next_frame(timeout=timeout)
+            dc = proto.parse_dc_short(frame)
+            if dc is not None:
+                cmd, sub = dc
+                if proto.is_dc_ack_for(cmd, sub, want_status):
+                    log.info(
+                        "got DC short-frame ack cmd=%d sub=%d matching awaited status=%d: %s",
+                        cmd, sub, want_status, frame.hex(),
+                    )
+                    return want_status
+                log.debug(
+                    "DC short frame cmd=%d sub=%d doesn't ack awaited status=%d, ignoring: %s",
+                    cmd, sub, want_status, frame.hex(),
+                )
+                continue
             status = proto.parse_cd_notify_status(frame) if loose else proto.parse_dial_watch_ack_status(frame)
             if status is None:
                 log.debug("skipping unparseable frame while waiting for status=%d: %s", want_status, frame.hex())

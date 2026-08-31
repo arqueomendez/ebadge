@@ -551,3 +551,400 @@ SuperBand subiendo una foto (opción "b" que se había dejado de lado) pasa
 a ser bastante más valiosa que seguir adivinando variantes del header --
 ya no es "afinar un formato confirmado", es "reconstruir un formato que
 nadie ha confirmado nunca".
+
+## 2026-08-31 (misma sesión) — Resultado de `--ru50-zero-unknown-fields`: falsifica también esta hipótesis
+
+Corrida real:
+
+```
+upload-dial BB:50:43:DE:85:96 imagen\reunion.jpg --ru50-zero-unknown-fields --fragment-size 0 --chunk-timeout 15 --retries 8 --inter-chunk-delay-ms 30
+```
+
+Transporte: 150/150 chunks confirmados sin un solo reintento (link estable
+esta vez). En el `finish`:
+
+- Un `status=1` que, decodificado (`cd0009200101000400000001` = cmd**32**/
+  sub**1**), es otra vez el eco tardío del ack del último chunk -- no una
+  respuesta real al finish. Mismo patrón ya visto y documentado.
+- Después: silencio total salvo el heartbeat/banner ya conocido y sin
+  relación (`cd001b15010c0016...`, cmd**21**/sub**12**, payload de puros
+  ceros -- el mismo frame que ya se había visto y documentado en la entrada
+  "Segunda corrida limpia" de más arriba, no es nada nuevo).
+- Igual que siempre: nunca llega `status=2`, nunca hay un rechazo explícito.
+  Se agotan los 2 intentos de 45s y falla.
+
+**Resultado: exactamente el mismo comportamiento que con los 6 campos
+"misteriosos" en sus valores originales (sin poner en cero).** Esto
+**falsifica** la hipótesis específica de la entrada anterior ("Hipótesis
+revisada") de que alguno de esos 6 campos concretos era la causa directa
+del cuelgue -- si lo fuera, ponerlos en cero (un valor claramente distinto
+al original) debería haber cambiado algo: un rechazo distinto, un
+`status=2`, o al menos un timing diferente. No cambió nada en absoluto.
+
+**Evaluación combinada con la investigación de hoy (ver entrada anterior
+"Investigación online"):** ya van dos hipótesis concretas probadas y
+descartadas sobre el contenido de la subida --
+
+1. "El firmware espera un conteo fijo de bytes" -- descartada (rellenar a
+   115200 bytes no cambió el resultado).
+2. "Alguno de los 6 campos desconocidos del header es la causa" --
+   descartada recién ahora (ponerlos en cero no cambió el resultado).
+
+-- sumado a que la arqueología de git mostró que el formato RU50 que
+implementamos nunca fue confirmado por nadie contra hardware real, ni
+siquiera revisado por su propio autor (ver entrada anterior). La lectura
+más honesta en este punto: no es que nos falte encontrar el valor correcto
+de un par de campos -- es que **no tenemos ninguna confirmación de que la
+estructura completa que asumimos para RU50 sea la correcta**, y seguir
+variando constantes al azar dentro de esa estructura asumida tiene cada
+vez menos probabilidad de tener éxito, porque el espacio de búsqueda real
+podría no ser "estos 6 campos" sino "toda la forma del header".
+
+**Recomendación:** agotar variantes ciegas del header ya no es el camino
+más eficiente. El siguiente paso de mayor valor real es conseguir una
+captura BLE (HCI) de la app SuperBand real subiendo una foto -- aunque sea
+parcial o de menor calidad que un sysdiagnose completo de iOS (por ejemplo,
+un teléfono Android con "habilitar registro HCI" en las opciones de
+desarrollador, que genera un `btsnoop_hcp.log` legible sin depender de una
+Mac) -- para comparar byte a byte contra lo que arma `ru50.build_ru50_blob`
+en vez de seguir adivinando a ciegas.
+
+## 2026-08-31 (misma sesión) — Decisión: preguntar en el issue de GitHub en vez de seguir adivinando
+
+Ante la evidencia acumulada hoy (dos hipótesis de header descartadas +
+hallazgo de que RU50 nunca fue validado por nadie contra hardware real, ni
+siquiera por el autor de `ru50_convert.py`), se decidió NO seguir probando
+variantes del header a ciegas por ahora. En su lugar: publicar un
+comentario en el issue #2 de `DynamicDevices/lcd-badge-ble`, dirigido en
+particular a `jackghx` (quien sí tiene una captura real de sysdiagnose de
+iOS en hardware LJ733/V32399 y llegó al 99% de la subida), pidiendo si
+puede compartir los bytes reales del payload RU50 de esa captura para
+comparar byte a byte contra `ru50.build_ru50_blob`.
+
+Esta sesión no tiene credenciales de GitHub para publicar en nombre del
+usuario, así que el comentario quedó redactado en
+`docs/github_issue2_comment_draft.md` (en inglés, para la audiencia del
+repo) listo para que el usuario lo pegue directamente en
+https://github.com/DynamicDevices/lcd-badge-ble/issues/2 .
+
+**Pendiente:** publicar ese comentario y esperar respuesta. Mientras tanto,
+como alternativa que no depende de que alguien responda, sigue en pie la
+opción de conseguir una captura HCI propia (por ejemplo con un Android que
+tenga "habilitar registro HCI" en opciones de desarrollador) usando la app
+SuperBand real para subir una foto.
+
+## 2026-08-31 (misma sesión) — El fix real: header RU50 desensamblado desde el binario oficial de JieLi
+
+Se recibió (vía el issue de GitHub / un análisis de terceros dirigido a
+"Jack") un reporte de análisis estático serio sobre `libjl_bmp_convert.so`
+-- con `readelf`/`objdump`/`strings` reales, no una reconstrucción por IA
+sin verificar como la anterior. Antes de confiar en el contenido, se
+verificó todo de forma independiente:
+
+- Se clonó `Jieli-Tech/Android-JL_Bluetooth` (repo oficial de JieLi) y se
+  confirmó que `libs/BmpConvert_V1.6.0_10605-release.aar` existe
+  exactamente como se describía -- es un zip real, se pudo extraer.
+- Dentro del AAR: `jni/x86_64/libjl_bmp_convert.so` (ELF real, 448 KB).
+  `readelf -sW` confirma exactamente los símbolos descritos:
+  `br35_bmp_to_res`, `br35_bmp_to_res_path`, `br28_*`, `br23_*`,
+  `bmpConvert` (el dispatcher), y todos los símbolos ETC2/THUMB58H/
+  THUMB59T de `compressBlock*`/`decompressBlock*`.
+- Se desensambló `br35_bmp_to_res` (offset 0x12280, 1606 bytes) a mano con
+  `objdump -d -Mintel` y se leyó instrucción por instrucción la
+  construcción completa del header RU50.
+
+**Dos errores concretos encontrados en `ebadge/ru50.py` (ninguno tenía que
+ver con los 6 campos "misteriosos" que se venían sospechando):**
+
+1. `HDR_QW_04` estaba mal: el valor real (confirmado por
+   `movabs rax, 0x0000000100010500` en la instrucción real) tiene las dos
+   mitades de 16 bits del medio invertidas respecto a lo que veníamos
+   usando (`0x0000000100050100`).
+
+2. **El orden de los campos desde el offset 0x3C estaba mal -- este es
+   probablemente el motivo real del silencio en `finish` que se viene
+   arrastrando desde el primer intento con RU50.** El desensamblado
+   muestra la escritura real, en este orden exacto:
+   - offset 0x3C (u16): `crc_header`
+   - offset 0x3E (u16): `crc_payload`
+   - offset 0x40 (u32): flags (`0x00920001`, calculado como `A+B+1` según
+     una rama del código; el valor que veníamos usando parece ser el
+     correcto para el camino "normal", pero queda documentada la
+     alternativa `0x00228001` si hiciera falta)
+   - offset 0x44 (u16): ancho
+   - offset 0x46 (u16): alto
+   - offset 0x48 (u32): **el largo real del payload ETC2**
+   - offset 0x4C (u32): **una constante fija = 0x450** (el tamaño del
+     propio header) -- **no el largo del payload otra vez**, como
+     asumíamos.
+
+   Nuestra versión anterior ponía flags en 0x3C, un word combinado
+   `(crc_header<<16)|crc_payload` en 0x40, y el largo del payload en
+   0x4C en vez de la constante 0x450. Si el parser del firmware espera
+   leer el largo real del payload en 0x48 y en cambio ahí había flags (o
+   viceversa, el firmware interpreta lo que hay en 0x4C como el largo del
+   payload y ahí encuentra 0x450 en vez del largo real), tiene sentido
+   que se quede esperando indefinidamente una cantidad de datos que nunca
+   llega -- coincide exactamente con el síntoma observado (chunks OK,
+   silencio total e indefinido en `finish`, nunca un rechazo explícito).
+
+**También corregido:**
+- La zona "reservada" es `[0x50, 0x450)`, no `[0x14, 0x414)`. El
+  desensamblado muestra un `memset` de un buffer de 0x400 bytes en cero,
+  copiado con `memcpy` a `output+0x50` -- justo donde termina el último
+  campo del header (0x4C+4=0x50), sin ningún solapamiento. La versión
+  anterior "arreglaba" un solapamiento que en el código real nunca existió
+  (era un error de traducción del script que portamos, no del firmware).
+- Los 18 bytes que alimentan el segundo CRC16 (`crc_header`) llevan datos
+  reales en este orden: `crc_payload` (u16), flags (u32), ancho (u16),
+  alto (u16), largo del payload (u32), la constante 0x450 (u32) -- no
+  empiezan con flags ni terminan en un relleno en cero como asumíamos.
+
+**Verificado independientemente (no solo se copió el análisis recibido):**
+- La tabla CRC16 de 512 bytes en `.rodata` @ offset 0x9460 del `.so` se
+  volcó directo con `objdump -s` y es byte a byte idéntica a la que ya
+  teníamos en `ebadge/ru50.py` -- esa parte SÍ estaba bien desde el
+  principio.
+- Se desensambló también `Crc16` (offset 0x14000) y se confirmó que el
+  algoritmo (nibble alto primero, `crc=((crc<<4)&0xFFFF)^tabla[((crc>>12)^nibble)&0xF]`)
+  coincide exactamente con lo ya implementado.
+- Las 6 constantes "de significado desconocido" (`HDR_QW_18/20/28/30`,
+  `HDR_DW_38`) resultaron ser byte a byte idénticas a lo que ya
+  teníamos -- ese no era el problema, tal como ya habían mostrado las
+  pruebas de `--ru50-zero-unknown-fields`.
+
+**Estado:** `ebadge/ru50.py` fue reescrito con el layout corregido,
+`tests/test_ru50.py` actualizado (20/20 tests pasan). Esta es la primera
+vez que el header RU50 se arma a partir de desensamblado directo y
+verificado del binario real del fabricante, no de una reconstrucción de
+terceros sin verificar. Pendiente: **probar contra el badge real** -- todo
+lo anterior está confirmado a nivel de bytes/lógica, no de hardware.
+
+**Próximo paso:** repetir la subida real con el `ru50.py` corregido:
+
+```
+uv run python main.py --debug upload-dial BB:50:43:DE:85:96 imagen\reunion.jpg
+```
+
+(sin `--ru50-zero-unknown-fields` esta vez -- ya se descartó esa
+hipótesis, y ahora las 6 constantes están en sus valores reales
+confirmados por desensamblado, no por una extracción de terceros sin
+verificar).
+
+## 2026-08-31 (misma sesión) — El fix por desensamblado tampoco cambió nada: mismo silencio exacto
+
+Corrida real con el `ru50.py` corregido (offsets desde desensamblado real,
+sin `--ru50-zero-unknown-fields`):
+
+```
+uv run python main.py --debug upload-dial BB:50:43:DE:85:96 imagen\reunion.jpg
+```
+
+Resultado: **byte por byte el mismo patrón que con todas las versiones
+anteriores.** 150/150 chunks confirmados, el mismo `status=1` que es el eco
+del último chunk, el mismo heartbeat `cmd21/sub12` sin relación, dos
+intentos de 45s, mismo `gave up`. Ningún cambio observable pese a que esta
+vez el header corregido está verificado contra el binario real del
+fabricante (desensamblado, no una reconstrucción de terceros).
+
+**Esto es información valiosa, aunque negativa.** Ya van CUATRO variantes
+de contenido probadas, todas con el resultado idéntico:
+1. RGB565 crudo -- rechazo instantáneo y explícito (`status=1`, distinto a
+   todo lo demás).
+2. RU50 con el header original (offsets del script de terceros) -- silencio.
+3. RU50 con relleno a tamaño fijo -- silencio.
+4. RU50 con los 6 campos "desconocidos" en cero -- silencio.
+5. RU50 con el header corregido por desensamblado real -- **silencio,
+   idéntico**.
+
+Que la corrección (2)→(5), verificada contra el binario real y con motivo
+concreto (el orden de campos estaba mal), no haya cambiado NADA es un dato
+importante en sí mismo: sugiere que el parser de la firmware del badge no
+está siquiera llegando al punto de leer esos campos con matices distintos
+entre header viejo/nuevo, o que el bloqueo real está en otro lugar
+completamente distinto al contenido del archivo.
+
+**Nueva hipótesis, también salida del mismo desensamblado de hoy:** la
+función real `br35_bmp_to_res` tiene una rama "sin empaquetar" (el mismo
+desensamblado muestra `test BYTE PTR [rbp-0x450],0x0` -- un flag de
+"pack" que, si es falso, salta a un camino mucho más simple: un `memcpy`
+directo de la textura ETC2 comprimida al buffer de salida, **sin magic,
+sin header, sin CRC alguno** -- ver `br35_bmp_to_res_path_nopack` /
+`br28_bmp_to_res_path_nopack` en los símbolos del `.so`). Nunca se probó
+mandar la textura ETC2 pelada, sin el contenedor RU50 completo. Se agregó
+`--format etc2-nopack` a `upload-dial` para probar exactamente esto:
+
+```
+uv run python main.py --debug upload-dial BB:50:43:DE:85:96 imagen\reunion.jpg --format etc2-nopack
+```
+
+Para 240x240 esto manda 28800 bytes (144 chunks) en vez de 29904 (150
+chunks) -- los mismos bytes de textura ETC2, solo que sin los 1104 bytes
+de header/CRC alrededor.
+
+**Sigue en pie, y ahora con más peso, conseguir una captura real** de la
+app SuperBand subiendo una foto de verdad -- cuatro hipótesis de contenido
+descartadas con el mismo síntoma exacto es una señal fuerte de que seguir
+adivinando el contenido del archivo, aunque sea con buena base técnica,
+tiene rendimientos decrecientes.
+
+## 2026-08-31 (misma sesión) — Re-auditoría de la documentación: encontrado un formato de frame completo que nunca implementamos
+
+A pedido explícito de volver a revisar la documentación de los repos ya
+clonados (no solo el código nuevo), se releyó con más cuidado
+`dg01-ble/src/dial_upload.rs` y `main.rs` completos, no solo los fragmentos
+citados hasta ahora. Apareció algo que cambia el diagnóstico de raíz.
+
+**Hallazgo 1 (menor, de contexto):** el valor por defecto de `mid4`
+(`15a20008`) en `dial_start_extended` fue introducido citando
+`logs/upload-2.log.pcapng` como "captura exitosa de la app real" -- pero
+un commit del MISMO día (`a2efc96`, "docs: PCAP analysis") documenta que
+ese mismo archivo **no contiene ningún tráfico `cmd 31`** (ni start, ni
+chunks, ni finish -- solo preflight y clima). Es decir, el propio proyecto
+se contradice sobre el origen de ese valor, y nadie lo corrigió después
+(el commit de mayo con la captura real de iOS -- `096490d` -- tocó el
+framing del finish y el largo del start, pero no volvió a tocar `mid4`).
+Sigue siendo un valor plausible (viene de *algún* lado), pero su
+justificación documentada no se sostiene. Hay una función alternativa ya
+lista, `dial_start_mid4_dims_be(width, height)`, que deriva `mid4` de las
+dimensiones reales en vez de usar el valor fijo -- útil si el problema
+resultara estar ahí, aunque el hallazgo 2 de abajo es mucho más prometedor.
+
+**Hallazgo 2 (el importante): un formato de notificación completo que
+nunca portamos.** `dial_upload.rs` documenta que el firmware puede
+contestar con frames cortos de 8 bytes que empiezan con **`0xDC`** (no
+`0xCD`) -- un camino de notificación totalmente separado
+(`BaseReceiveData`'s "other branch" en la app, nunca mezclado con el
+protocolo `0xCD`). Ejemplos reales capturados:
+
+- `dc 00 05 15 0c 00 1e 01` -- cmd=0x15, sub=0x0c. **Es exactamente el
+  mismo cmd/sub del frame que venimos descartando como "heartbeat/banner
+  sin relación" en cada corrida** (nuestra versión llega envuelta en un
+  frame `0xCD` de 22 bytes de payload en cero, pero el cmd/sub es
+  idéntico).
+- `dc 00 05 1f 02 00 19 01` -- cmd=31 (`CMD_DIAL_TRANSFER`), sub=2
+  (`SUB_DIAL_START`). El commit `096490d` (la captura real de sysdiagnose
+  de iOS en hardware LJ733) dice textual: **"DC frame ACK: accept dc 00 05
+  1f 02 00 19 01 as valid start ACK"**.
+
+Y en `main.rs`, la función que espera acks (`await_dial_ack` o equivalente)
+tiene esta regla explícita: un frame `0xDC` con **cmd=31/sub=3 cuenta como
+ACK válido de `finish`** (`want==2`), totalmente aparte de cualquier
+paquete `0xCD` con un entero de status. También cmd=0 con sub igual al
+número de chunk cuenta como ack de ESE chunk.
+
+**Por qué esto es gigante:** nuestro `CdNotifyAssembler` (`ebadge/protocol.py`)
+sólo reconoce frames que empiezan con `0xCD`. Cualquier notificación que
+empezara con `0xDC` era **descartada en silencio, sin ningún rastro en el
+log** (`push()`: si el primer byte no es el marcador esperado, busca el
+siguiente `0xCD` y si no lo encuentra, vacía el buffer completo). Nuestro
+`_on_notify` sólo logueaba bytes que ya habían sido reconocidos como frame
+completo -- nunca los bytes crudos. Es decir: **si el ack real de `finish`
+para este firmware llega como un frame `0xDC` corto en vez de un `status=2`
+en formato `0xCD`, nuestro programa nunca lo habría visto, nunca lo habría
+logueado, y se habría quedado esperando indefinidamente algo que en
+realidad sí llegó** -- exactamente el síntoma que venimos observando
+(silencio total, nunca un rechazo explícito) en las CUATRO variantes de
+contenido RU50 probadas hasta ahora, todas con el resultado idéntico. Que
+el contenido del archivo no haya importado nunca tiene mucho más sentido
+si el problema no era el contenido, sino que estábamos ciegos a la
+confirmación de éxito.
+
+**Corregido:**
+- `ebadge/protocol.py`: agregado `FRAME_MARKER_DC = 0xDC`,
+  `parse_dc_short()` (puerto directo de la función Rust homónima) y
+  `is_dc_ack_for(cmd, sub, want_status)` (puerto de la regla de aceptación
+  que usa `dg01-ble` para start/finish/chunk).
+- `ebadge/ble.py`: `_on_notify` ahora loguea **todo** byte crudo recibido
+  (`<< raw ...`) antes de intentar interpretarlo -- para no volver a
+  quedar ciegos a un formato que no reconocemos -- y detecta frames `0xDC`
+  cortos, encolándolos para que `_await_ack` los vea. `_await_ack` ahora
+  chequea primero si el frame es un `0xDC` corto y, si su cmd/sub
+  corresponde al `want_status` que se está esperando (start/finish/chunk),
+  lo acepta como ack válido inmediatamente.
+- `tests/test_protocol.py`: 3 tests nuevos para `parse_dc_short` /
+  `is_dc_ack_for` (23/23 tests pasan en total, verificado en un venv
+  aislado fuera de la carpeta del proyecto).
+
+**Próximo paso:** repetir la subida real (sin cambiar nada del formato RU50
+-- ya está en su versión corregida por desensamblado del turno anterior):
+
+```
+uv run python main.py --debug upload-dial BB:50:43:DE:85:96 imagen\reunion.jpg
+```
+
+Con el nuevo logueo de `<< raw ...`, esta corrida va a mostrar por primera
+vez si el badge efectivamente manda algún frame `0xDC` durante el `finish`
+que antes pasaba completamente desapercibido. Si aparece uno con cmd=31/
+sub=3, `_await_ack` ahora lo va a aceptar automáticamente como éxito. Si no
+aparece ninguno, al menos vamos a poder confirmarlo con certeza en vez de
+seguir asumiendo silencio total.
+
+## 2026-08-31 (misma sesión) — Releída la letra chica del issue #2: nadie lo comentó todavía, y pide cosas que nunca probamos
+
+A pedido explícito de "revisar con mayor detalle" el issue
+https://github.com/DynamicDevices/lcd-badge-ble/issues/2, se volvió a
+traer el cuerpo COMPLETO y verbatim (no un resumen) y se confirmó el
+estado real de los comentarios.
+
+**Dato importante: el issue sigue sin ningún comentario.** Se verificó
+dos veces -- la página no muestra ningún comentario de nadie, incluido
+`jackghx`. Esto significa que el análisis estático de
+`libjl_bmp_convert.so` que compartiste ("for Jack") **no vino de este
+issue** -- debe haber llegado por otro canal (¿le escribiste directo a
+Jack, o es de otra fuente?). Vale la pena confirmar esto porque cambia
+cómo seguimos: si tenés forma de contactar a Jack directamente, la
+pregunta 5 del issue original (ver abajo) sería el pedido más valioso que
+se le puede hacer.
+
+**El cuerpo original del issue (de `ajlennon`, reportando lo que
+`jackghx` encontró) dice algo que no habíamos registrado con el peso que
+merece:** *"El stock app puede llevar una subida a ~100% de la UI y ahí
+se cuelga"* -- es decir, **la app oficial real, con el firmware/encoder
+real, exhibe el mismo síntoma de congelamiento que nosotros**. Esto no
+prueba que nuestro formato esté bien, pero sí abre la posibilidad real de
+que el "silencio al final" no sea (solo) un bug de nuestra
+reimplementación -- podría ser un comportamiento genuino de esta
+variante de firmware/hardware que ni siquiera el vendor resolvió del
+todo, al menos en el equipo de prueba de Jack.
+
+**El issue pide explícitamente 5 cosas para decidir el siguiente paso.
+Repasando cuáles ya tenemos y cuáles no:**
+
+1. *Definición de RU50 con un hex de ejemplo* -- ya lo resolvimos nosotros
+   solos, con más detalle del que el propio issue tenía (desensamblado
+   real de `br35_bmp_to_res`, ver entradas de más arriba).
+2. *Caracterización de la pérdida de paquetes en las capturas* -- no
+   aplica a nuestro caso: nosotros somos la app, tenemos visibilidad
+   completa de cada byte que mandamos y recibimos, no dependemos de un
+   sniffer externo con huecos.
+3. **"¿Al llegar a 100%, el dispositivo sigue notificando algo (status/
+   error) o el tráfico se corta por completo?"** -- **esto ya lo podemos
+   contestar con nuestros propios datos**, y es una respuesta útil para
+   aportar de vuelta al issue: el tráfico NO se corta del todo -- sigue
+   llegando un frame periódico (`cmd 0x15/sub 0x0c`, "banner", cada ~30s)
+   y una vez un eco tardío del último chunk -- pero nunca un cambio de
+   estado real ni un rechazo explícito.
+4. **"¿Una carga sintética mínima (1x1 o las dimensiones de dial más
+   chicas permitidas), tageada/formateada como la app, se completa? ¿O
+   la falla solo pasa con transferencias a resolución completa?"** --
+   **nunca probamos esto.** Es barato de probar con lo que ya tenemos
+   (`--width`/`--height` ya se pueden forzar de forma independiente del
+   tamaño real de pantalla del badge) y responde algo importante: si un
+   RU50 chico se completa bien, el problema es de tamaño/tiempo, no de
+   formato -- si también cuelga igual, refuerza que el problema es de
+   protocolo/formato y no de tamaño.
+5. *Un asset "de verdad" (exportado por el fabricante o de la propia
+   APK) para comparar byte a byte el primer chunk* -- no lo tenemos. Si
+   tenés forma de pedírselo a Jack directamente (ya que él llegó al 99%
+   con captura real), sería el dato más valioso posible en este momento.
+
+**Próximo test sugerido (pregunta 4 del issue, nunca probada):**
+
+```
+uv run python main.py --debug upload-dial BB:50:43:DE:85:96 --solid 255,0,0 --width 8 --height 8
+```
+
+(un cuadrado sólido de 8x8, mucho más chico que la pantalla real de
+240x240 -- el firmware podría rechazarlo por tamaño, lo cual también
+sería información útil y explícita, a diferencia del silencio actual.)

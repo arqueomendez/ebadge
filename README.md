@@ -61,18 +61,83 @@ header) estaba pisando sus propios campos, y cómo se corrigió acá.
 
 `upload-dial` ahora usa este formato por defecto (`--format ru50`, requiere
 el paquete `etcpak`, que ya viene en las dependencias). Para 240x240 el blob
-resultante pesa ~29.9 KB en vez de 112.5 KB — 150 chunks en vez de 576. Esto
-sigue siendo una hipótesis con buena evidencia, no una solución confirmada:
-el propio issue de `dg01-ble` que documenta esto (#2) sigue abierto y nadie
-ha reportado todavía haber visto una imagen custom de verdad en pantalla. Si
-`--format ru50` también termina rechazado, el siguiente paso sería pedir/
-capturar un `.bin` real exportado por el fabricante para comparar byte a
-byte contra lo que arma `ru50.build_ru50_blob`, o revisar si el firmware
-`V35509` (más nuevo que el `V32399` que probó el fix de mayo) espera algo
-distinto en el header.
+resultante pesa ~29.9 KB en vez de 112.5 KB — 150 chunks en vez de 576.
+
+**Corrección del 2026-08-31 (mediodía):** al principio se describió esto
+como "una hipótesis con buena evidencia". Revisando la historia completa
+de git de `dg01-ble`, la evidencia real resultó ser más débil de lo que
+parecía: `ru50_convert.py` nació 3 días después de que el issue #2 tratara
+RU50 como una incógnita total, con ayuda de un agente de IA, decompilando
+una librería (`libjl_bmp_convert.so`) que nunca se subió al repo, y con un
+bug de escritura del header presente sin cambios desde su primer commit —
+fuerte indicio de que nadie, ni su propio autor, llegó a probarlo contra
+un badge real. Se probaron dos hipótesis sobre el contenido (relleno a un
+largo fijo de bytes, y poner en cero los 6 campos "de significado
+desconocido") y ambas fallaron igual: silencio total en el `finish`.
+
+**Corrección del 2026-08-31 (tarde) — el fix real:** en vez de seguir
+adivinando, se bajó el AAR oficial de JieLi
+(`Jieli-Tech/Android-JL_Bluetooth`, `libs/BmpConvert_V1.6.0_10605-release.aar`,
+que sí es un zip real y verificable) y se desensambló directamente
+(`objdump`/`readelf`) la función real `br35_bmp_to_res` de
+`libjl_bmp_convert.so` — el mismo camino que la línea de chips "707N"
+(`TYPE_707N_*`) usa para producir blobs RU50. Comparando esa desensamblada
+contra `ebadge/ru50.py` byte a byte aparecieron dos errores concretos,
+ninguno de los cuales tenía que ver con los 6 campos que se venían
+sospechando:
+
+1. Una de las constantes del header (`HDR_QW_04`) tenía dos mitades de 16
+   bits invertidas respecto del valor real.
+2. **El orden de los campos desde el offset 0x3C estaba mal.** El real es:
+   `crc_header` (u16) en 0x3C, `crc_payload` (u16) en 0x3E, flags (u32) en
+   0x40, ancho en 0x44, alto en 0x46, **el largo real del payload ETC2**
+   en 0x48, y recién en 0x4C una constante fija de valor 0x450 (el tamaño
+   del propio header) — **no el largo del payload otra vez**, como
+   asumíamos. Si el firmware lee el largo del payload en la posición que
+   nosotros tomamos por "constante fija" (y viceversa), tiene sentido que
+   se quede esperando una cantidad de datos completamente distinta a la
+   que mandamos — que es exactamente el síntoma que veníamos observando
+   (todos los chunks confirmados, silencio total e indefinido en el
+   `finish`, nunca un rechazo explícito).
+
+También se corrigió el rango de la zona "reservada" (es `[0x50, 0x450)`,
+no `[0x14, 0x414)` como se asumía) y la construcción de los 18 bytes que
+alimentan el segundo CRC16 (`crc_header`), que ahora usan los valores
+reales (`crc_payload`, flags, ancho, alto, largo del payload, y la
+constante 0x450) en vez de un relleno en cero. El detalle completo,
+byte por byte, está en `ebadge/ru50.py` y en `BITACORA.md`.
+
+Esta vez la evidencia es de otro calibre: no es una reconstrucción de IA
+sin verificar, es la lectura directa del código real que el propio
+fabricante distribuye y que corre en los teléfonos.
+
+**Resultado contra hardware real: sin cambios.** Una subida real con este
+header corregido dio el mismo silencio total, byte por byte idéntico a
+todas las variantes anteriores. Cuatro hipótesis de contenido distintas
+(header original, relleno a tamaño fijo, campos "desconocidos" en cero,
+header corregido por desensamblado) dieron el mismo resultado exacto --
+señal de que el problema probablemente no estaba en el contenido del
+archivo.
+
+**Corrección del 2026-08-31 (noche) — encontramos por qué "nada cambiaba":**
+releyendo con más cuidado la documentación de `dg01-ble` (no solo los
+fragmentos ya citados) apareció un formato de notificación completo que
+este proyecto nunca implementó: frames cortos de 8 bytes que empiezan con
+**`0xDC`** en vez de `0xCD` -- un camino de ack totalmente separado que el
+propio `dg01-ble` documenta como válido para el `finish` (`cmd 31 sub 3`)
+y para el `start` (`cmd 31 sub 2`), confirmado contra hardware real en el
+mismo commit de mayo (`096490d`). Nuestro `CdNotifyAssembler` sólo
+reconocía frames `0xCD` -- cualquier notificación `0xDC` se descartaba en
+silencio, sin dejar rastro en el log. Si el ack real de `finish` de este
+firmware llega en formato `0xDC`, tiene sentido que cambiar el contenido
+del archivo nunca haya cambiado nada: el problema nunca fue el contenido,
+sino que no podíamos ver la confirmación de éxito. Corregido en
+`ebadge/protocol.py`/`ebadge/ble.py` -- detalle completo en `BITACORA.md`.
+Pendiente confirmar contra hardware real.
 
 `--format rgb565` se mantiene como comparación/respaldo, pero cada subida
-real que hicimos con él fue rechazada en el `finish`.
+real que hicimos con él fue rechazada en el `finish` (de forma explícita e
+instantánea, a diferencia del silencio que daba RU50).
 
 ## Qué está verificado vs. qué es "lo más plausible que tenemos"
 

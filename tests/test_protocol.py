@@ -112,3 +112,34 @@ def test_parse_dial_watch_ack_status_recognizes_chunk_and_start_acks():
 def test_parse_cd_notify_status_reads_finish_ack_loosely():
     finish_ack = proto.get_protocol(proto.CMD_DIAL_TRANSFER, proto.SUB_DIAL_FINISH, (2).to_bytes(4, "big", signed=True))
     assert proto.parse_cd_notify_status(finish_ack) == proto.STATUS_OK
+
+
+def test_parse_dc_short_reads_cmd_and_sub():
+    # Real captured constant from dg01-ble (PREFLIGHT_UPLOAD2_DC1): the
+    # exact same cmd=0x15/sub=0x0c "banner" this project logged as
+    # unrelated noise on every 0xCD-framed run.
+    banner = bytes([0xDC, 0x00, 0x05, 0x15, 0x0C, 0x00, 0x1E, 0x01])
+    assert proto.parse_dc_short(banner) == (0x15, 0x0C)
+
+    start_ack = bytes([0xDC, 0x00, 0x05, 0x1F, 0x02, 0x00, 0x19, 0x01])  # from upstream commit 096490d
+    assert proto.parse_dc_short(start_ack) == (proto.CMD_DIAL_TRANSFER, proto.SUB_DIAL_START)
+
+
+def test_parse_dc_short_rejects_non_dc_or_short_packets():
+    assert proto.parse_dc_short(b"") is None
+    assert proto.parse_dc_short(b"\xdc\x00\x00") is None  # too short
+    assert proto.parse_dc_short(proto.dial_dims_request()) is None  # 0xCD, not 0xDC
+
+
+def test_is_dc_ack_for_start_finish_and_chunk_conventions():
+    # Start: cmd31/sub2 acks a want_status==1000 wait.
+    assert proto.is_dc_ack_for(proto.CMD_DIAL_TRANSFER, proto.SUB_DIAL_START, 1000) is True
+    # Finish: cmd31/sub3 acks a want_status==STATUS_OK wait.
+    assert proto.is_dc_ack_for(proto.CMD_DIAL_TRANSFER, proto.SUB_DIAL_FINISH, proto.STATUS_OK) is True
+    # Chunk: cmd0 with sub matching the chunk offset (want_status - 1000).
+    assert proto.is_dc_ack_for(0, 7, 1007) is True
+    assert proto.is_dc_ack_for(0, 0, 1000) is True  # cmd0/sub0 also covers the start-equivalent case
+    # Mismatches must not be accepted.
+    assert proto.is_dc_ack_for(proto.CMD_DIAL_TRANSFER, proto.SUB_DIAL_START, proto.STATUS_OK) is False
+    assert proto.is_dc_ack_for(proto.CMD_DIAL_TRANSFER, proto.SUB_DIAL_FINISH, 1000) is False
+    assert proto.is_dc_ack_for(0, 3, 1007) is False

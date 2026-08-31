@@ -1,10 +1,14 @@
 """Tests for the RU50 container format (ebadge/ru50.py).
 
-These check the pure byte-layout/CRC logic against the values reverse-
-engineered upstream (DynamicDevices/lcd-badge-ble's `ru50_convert.py`,
-itself extracted from the vendor's own BmpConvert 1.6.0 binary) -- they
-don't prove a real badge accepts this format, only that our port matches
-the reference tool byte-for-byte, same spirit as test_protocol.py.
+These check the pure byte-layout/CRC logic against values confirmed on
+2026-08-31 by disassembling the real `br35_bmp_to_res` / `Crc16` functions
+in `libjl_bmp_convert.so` (extracted from the official
+`Jieli-Tech/Android-JL_Bluetooth` repo's BmpConvert AAR) -- see the module
+docstring in ebadge/ru50.py for the full story, including what the
+earlier (upstream-ported) version of this file got wrong. They don't
+prove a real badge accepts this format, only that our encoder matches the
+vendor's own disassembled code byte-for-byte, same spirit as
+test_protocol.py.
 """
 import struct
 
@@ -40,26 +44,30 @@ def test_build_ru50_blob_header_layout():
     assert magic == ru50.MAGIC_RU50
     assert bytes(blob[0:4]) == b"RU50"  # "RU50" read as little-endian ASCII == the magic constant
 
+    # Field order confirmed by disassembly: crc_header, crc_payload, flags,
+    # width, height, ETC2 payload length, then a fixed 0x450 constant --
+    # NOT flags+packed-CRC followed by width/height/payload-length, which
+    # is what earlier versions of this file (and its upstream source)
+    # assumed.
+    crc_header, crc_payload = struct.unpack_from("<HH", blob, 0x3C)
+    flags = struct.unpack_from("<I", blob, 0x40)[0]
     width, height = struct.unpack_from("<HH", blob, 0x44)
-    assert (width, height) == (240, 240)
-    payload_len = struct.unpack_from("<I", blob, 0x4C)[0]
-    assert payload_len == len(payload)
+    payload_len = struct.unpack_from("<I", blob, 0x48)[0]
+    header_size_const = struct.unpack_from("<I", blob, 0x4C)[0]
 
-    flags, crc_word = struct.unpack_from("<II", blob, 0x3C)
     assert flags == ru50.HDR_FLAGS
-    crc_payload = crc_word & 0xFFFF
-    crc_header = (crc_word >> 16) & 0xFFFF
+    assert (width, height) == (240, 240)
+    assert payload_len == len(payload)
+    assert header_size_const == ru50.PAYLOAD_OFF  # fixed 0x450, not the payload length
     assert crc_payload == ru50.crc16(payload)
     assert crc_header == ru50.crc16(ru50._header_crc_slice(240, 240, len(payload), crc_payload))
 
-    # Everything after the last known field (payload length ends at 0x50)
-    # up to the payload offset is genuinely unmapped/reserved and should be
-    # zero-filled -- unlike bytes [0x14, 0x50), which nominally fall inside
-    # the "reserved" range but are actually where flags/CRC/width/height/
-    # payload-length live (see build_ru50_blob's docstring on the source
-    # script's write-order bug this port fixes).
-    tail_reserved = blob[0x50 : ru50.PAYLOAD_OFF]
-    assert tail_reserved == bytes(len(tail_reserved))
+    # [0x50, PAYLOAD_OFF) is the real vendor "reserved" span (confirmed by
+    # disassembly: a memset+memcpy of a zeroed 0x400-byte scratch buffer to
+    # exactly this offset) and must be zero-filled.
+    reserved = blob[0x50 : ru50.PAYLOAD_OFF]
+    assert reserved == bytes(len(reserved))
+    assert len(reserved) == ru50.HEADER_RESERVED_LEN == 0x400
 
     assert blob[ru50.PAYLOAD_OFF :] == payload
 
@@ -69,11 +77,13 @@ def test_zero_unknown_fields_leaves_known_fields_intact():
     normal = ru50.build_ru50_blob(240, 240, payload)
     zeroed = ru50.build_ru50_blob(240, 240, payload, zero_unknown_fields=True)
 
-    # The 6 genuinely-unknown constant fields differ...
+    # The 6 constant fields (values confirmed by disassembly, purpose still
+    # unknown) differ when zeroed...
     assert normal[0x04:0x3C] != zeroed[0x04:0x3C]
     assert zeroed[0x04:0x3C] == bytes(0x3C - 0x04)
-    # ...but magic, width/height, payload length, flags, and both CRCs must
-    # be identical either way -- those are the fields we're confident about.
+    # ...but magic, the two CRCs, flags, width/height, payload length, and
+    # the fixed 0x450 constant must be identical either way -- those are
+    # unaffected by this diagnostic flag.
     assert normal[0x00:0x04] == zeroed[0x00:0x04] == b"RU50"
     assert normal[0x3C:0x50] == zeroed[0x3C:0x50]
     assert normal[ru50.PAYLOAD_OFF:] == zeroed[ru50.PAYLOAD_OFF:] == payload
@@ -89,5 +99,7 @@ def test_solid_color_round_trips_through_etc2_at_expected_size():
     blob = ru50.solid_ru50(16, 16, (255, 0, 0))
     expected_payload_len = ru50.scratch_bytes(16, 16)
     assert len(blob) == ru50.PAYLOAD_OFF + expected_payload_len
-    payload_len_field = struct.unpack_from("<I", blob, 0x4C)[0]
+    payload_len_field = struct.unpack_from("<I", blob, 0x48)[0]
     assert payload_len_field == expected_payload_len
+    header_size_const = struct.unpack_from("<I", blob, 0x4C)[0]
+    assert header_size_const == ru50.PAYLOAD_OFF

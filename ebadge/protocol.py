@@ -23,6 +23,25 @@ import struct
 from dataclasses import dataclass
 
 FRAME_MARKER = 0xCD
+# A SECOND, entirely different notify format the badge can use, discovered
+# 2026-08-31 by re-reading dg01-ble's Rust source instead of just its
+# constants: an 8-byte frame starting with 0xDC (not 0xCD), cmd at byte[3],
+# sub at byte[4] -- "BaseReceiveData"'s other notify branch, never merged
+# with the 0xCD frame protocol. Confirmed real (not a guess) by dg01-ble's
+# own captured constants (PREFLIGHT_UPLOAD2_DC1 = `dc 00 05 15 0c 00 1e 01`,
+# i.e. cmd=0x15/sub=0x0c -- the SAME "banner" cmd/sub this project has been
+# logging as unrelated noise every single run) and by upstream commit
+# 096490d ("DC frame ACK: accept dc 00 05 1f 02 00 19 01 as valid start
+# ACK"). This project's CdNotifyAssembler only ever recognized 0xCD-prefixed
+# frames -- any 0xDC-prefixed notification was silently discarded with zero
+# trace in the debug log (see CdNotifyAssembler.push: a leading byte that
+# isn't FRAME_MARKER just gets skipped/dropped). If this firmware's finish
+# ack for RU50 arrives as a short DC frame rather than a 0xCD status=2
+# packet, EVERY test run so far would look exactly like "total silence" from
+# this project's point of view regardless of what was inside the uploaded
+# file -- which matches the fact that four different RU50 payload variants
+# (see BITACORA.md) all produced byte-for-byte identical finish-silence.
+FRAME_MARKER_DC = 0xDC
 
 # --- command / sub-key constants (verbatim values from dial_upload.rs) -----
 CMD_DIAL_TRANSFER = 31  # 0x1F -- host -> badge: start / chunk / finish an upload
@@ -224,6 +243,34 @@ class CdNotifyAssembler:
             out.append(bytes(self._buf[:need]))
             del self._buf[:need]
         return out
+
+
+def parse_dc_short(packet: bytes) -> tuple[int, int] | None:
+    """Port of Rust `parse_dc_short`: an 8-byte 0xDC-marker notify, cmd at
+    packet[3], sub at packet[4]. See the FRAME_MARKER_DC comment above for
+    why this project never implemented this until 2026-08-31.
+    """
+    if not packet or packet[0] != FRAME_MARKER_DC or len(packet) < 6:
+        return None
+    return packet[3], packet[4]
+
+
+def is_dc_ack_for(cmd: int, sub: int, want_status: int) -> bool:
+    """Port of the DC-frame acceptance rule `dg01-ble`'s main.rs uses for
+    both dial start and finish waits: a DC frame with cmd31/sub2 acks a
+    start wait (`want_status == 1000`), cmd31/sub3 acks a finish wait
+    (`want_status == STATUS_OK`), and cmd0 with sub equal to the
+    chunk-index offset (`want_status - 1000`) acks that specific chunk --
+    an alternate, cmd-zero convention some firmware apparently uses instead
+    of (or alongside) the normal cmd32/sub1 chunk-ack counter.
+    """
+    if cmd == CMD_DIAL_TRANSFER and sub == SUB_DIAL_START and want_status == 1000:
+        return True
+    if cmd == CMD_DIAL_TRANSFER and sub == SUB_DIAL_FINISH and want_status == STATUS_OK:
+        return True
+    if cmd == 0 and (want_status == 1000 or sub == want_status - 1000):
+        return True
+    return False
 
 
 def parse_cd_notify_status(packet: bytes) -> int | None:

@@ -44,12 +44,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_upload.add_argument("--fit", choices=["cover", "contain", "stretch"], default="cover")
     p_upload.add_argument(
         "--format",
-        choices=["ru50", "rgb565"],
+        choices=["ru50", "etc2-nopack", "rgb565"],
         default="ru50",
-        help="wire payload format. 'ru50' (default) builds the proprietary RU50/ETC2 container that a "
-        "2026-05 upstream fix (tested on our exact LJ733 board) points to as what the real SuperBand app "
-        "sends -- requires the 'etcpak' package. 'rgb565' is the original raw-pixel guess, kept only for "
-        "comparison; every real upload we've run with it was rejected at the finish step.",
+        help="wire payload format. 'ru50' (default) builds the proprietary RU50/ETC2 container -- header "
+        "field layout confirmed 2026-08-31 by disassembling the real vendor libjl_bmp_convert.so, but a "
+        "real-hardware test with that corrected header still hung identically at finish, so this default "
+        "is not yet proven to work. 'etc2-nopack' sends just the raw ETC2-compressed texture with NO RU50 "
+        "wrapper at all -- byte-for-byte what the same disassembly shows the vendor encoder produces when "
+        "its internal 'pack' flag is off; a disassembly-backed guess, not yet tested against real hardware "
+        "either. 'rgb565' is the original raw-pixel guess, kept only for comparison; every real upload "
+        "we've run with it was rejected instantly at the finish step. See BITACORA.md's 2026-08-31 entries.",
     )
     p_upload.add_argument(
         "--finish-length-prefix",
@@ -86,10 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_upload.add_argument(
         "--ru50-zero-unknown-fields",
         action="store_true",
-        help="DIAGNOSTIC ONLY (--format ru50 only): zero out the RU50 header's 6 fields with genuinely unknown "
-        "meaning (lifted verbatim from one specific vendor-tool binary extraction) instead of their captured "
-        "values, to test whether they're real fixed requirements or artifacts of that one extraction. See "
-        "ru50.build_ru50_blob's docstring and BITACORA.md's 2026-08-31 entries",
+        help="DIAGNOSTIC ONLY (--format ru50 only): zero out 6 constant RU50 header fields instead of their "
+        "real values (RESULT: falsified -- a real-hardware test on 2026-08-31 got the exact same finish-silence "
+        "either way, and a same-day disassembly of the real vendor library confirmed those 6 fields' values are "
+        "correct as captured -- the real bug turned out to be the field ORDER from offset 0x3C onward, fixed "
+        "directly in ru50.build_ru50_blob, not these fields. Kept for reference only; see BITACORA.md's "
+        "2026-08-31 entries)",
     )
     p_upload.add_argument(
         "--upload-attempts",
@@ -165,6 +171,16 @@ def _encode_payload(args: argparse.Namespace, width: int, height: int) -> bytes:
             print(f"encoded {args.image} -> {len(payload)} bytes RU50/ETC2 ({width}x{height}, fit={args.fit}{suffix})")
         return payload
 
+    if args.format == "etc2-nopack":
+        if args.solid:
+            color = _parse_rgb(args.solid)
+            payload = ru50.solid_etc2_nopack(width, height, color)
+            print(f"encoded solid color {color} -> {len(payload)} bytes raw ETC2, no RU50 wrapper ({width}x{height})")
+        else:
+            payload = ru50.image_to_etc2_nopack(args.image, width, height, fit=args.fit)
+            print(f"encoded {args.image} -> {len(payload)} bytes raw ETC2, no RU50 wrapper ({width}x{height}, fit={args.fit})")
+        return payload
+
     if args.solid:
         color = _parse_rgb(args.solid)
         payload = image.solid_rgb565(width, height, color)
@@ -180,12 +196,12 @@ async def _cmd_upload_dial(args: argparse.Namespace) -> int:
         print("error: pass exactly one of IMAGE or --solid R,G,B", file=sys.stderr)
         return 2
 
-    if args.format == "ru50":
+    if args.format in ("ru50", "etc2-nopack"):
         try:
             import etcpak  # noqa: F401
         except ImportError:
             print(
-                "error: --format ru50 (the default) needs the 'etcpak' package for ETC2 texture "
+                f"error: --format {args.format} needs the 'etcpak' package for ETC2 texture "
                 "compression. Install it with `uv add etcpak` (or `pip install etcpak`), or pass "
                 "--format rgb565 to fall back to the old raw-pixel format instead.",
                 file=sys.stderr,
