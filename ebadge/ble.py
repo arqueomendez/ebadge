@@ -15,6 +15,7 @@ from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 
 from . import protocol as proto
+from . import jpeg
 
 log = logging.getLogger("ebadge.ble")
 
@@ -147,12 +148,14 @@ class EBadge:
         *,
         fragment_size: int = DEFAULT_FRAGMENT_SIZE,
         fragment_gap_s: float = DEFAULT_FRAGMENT_GAP_S,
+        ack_notifications: bool = False,
     ) -> None:
         self._client = client
         self._tx_uuid = tx_uuid
         self._rx_uuids = rx_uuids
         self._fragment_size = fragment_size
         self._fragment_gap_s = fragment_gap_s
+        self._ack_notifications = ack_notifications
         self._asm = proto.CdNotifyAssembler()
         self._frames: asyncio.Queue[bytes] = asyncio.Queue()
 
@@ -164,6 +167,7 @@ class EBadge:
         *,
         fragment_size: int = DEFAULT_FRAGMENT_SIZE,
         fragment_gap_s: float = DEFAULT_FRAGMENT_GAP_S,
+        ack_notifications: bool = False,
     ) -> "EBadge":
         device = await _find_device(address_or_name, timeout)
         if device is None:
@@ -193,7 +197,10 @@ class EBadge:
                 f"(looked for 7e400001.../6e400001...; device advertised: {found})"
             )
 
-        badge = cls(client, tx_uuid, rx_uuids, fragment_size=fragment_size, fragment_gap_s=fragment_gap_s)
+        badge = cls(
+            client, tx_uuid, rx_uuids, fragment_size=fragment_size,
+            fragment_gap_s=fragment_gap_s, ack_notifications=ack_notifications,
+        )
         try:
             for rx in rx_uuids:
                 await client.start_notify(rx, badge._on_notify)
@@ -258,7 +265,10 @@ class EBadge:
 
     async def _next_frame(self, timeout: float = NOTIFY_TIMEOUT_S) -> bytes:
         try:
-            return await asyncio.wait_for(self._frames.get(), timeout=timeout)
+            frame = await asyncio.wait_for(self._frames.get(), timeout=timeout)
+            if self._ack_notifications and frame[0] == proto.FRAME_MARKER:
+                await self._write_frame(jpeg.ack(frame))
+            return frame
         except asyncio.TimeoutError as exc:
             raise ProtocolError(f"badge did not reply within {timeout:.0f}s") from exc
 
@@ -279,6 +289,7 @@ class EBadge:
         self,
         image_bytes: bytes,
         *,
+        jpeg_profile: bool = False,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_retries: int = 3,
         chunk_timeout_s: float = NOTIFY_TIMEOUT_S,
@@ -289,7 +300,11 @@ class EBadge:
         finish_include_length: bool = False,
         on_progress=None,
     ) -> None:
-        """Push `image_bytes` (already RGB565-encoded, no header) as the dial image.
+        """Push an encoded image, using the captured BG02 profile if requested.
+
+        jpeg_profile=True selects length-prefixed JPEG, one-based sequence
+        numbers, 5000-byte chunks, u32 chunk sums, and CD notification ACKs.
+        Legacy formats retain their existing start/chunk framing.
 
         Ack counter, confirmed against a real BW03 capture on 2026-08-30: the
         badge replies with `1000 + chunks_successfully_received_so_far`, NOT
@@ -303,8 +318,12 @@ class EBadge:
         recognizable frame; it keeps reading until it sees the exact status
         it asked for, logging anything else as a warning.
         """
+        if jpeg_profile:
+            self._ack_notifications = True
+            chunk_size = 5000
         status = await self._send_with_retry(
-            lambda: proto.dial_start_extended(len(image_bytes)), want_status=1000, retries=chunk_retries
+            lambda: jpeg.start(len(image_bytes)) if jpeg_profile else proto.dial_start_extended(len(image_bytes)),
+            want_status=1000, retries=chunk_retries
         )
         log.info("upload start ack: status=%s", status)
 
@@ -314,7 +333,7 @@ class EBadge:
             chunk = image_bytes[offset : offset + chunk_size]
             want = 1000 + seq + 1  # 1-indexed count of chunks received, not `seq`
             await self._send_with_retry(
-                lambda c=chunk, s=seq: proto.uart_file_chunk(s, c),
+                lambda c=chunk, s=seq: jpeg.chunk(s + 1, c) if jpeg_profile else proto.uart_file_chunk(s, c),
                 want_status=want,
                 retries=chunk_retries,
                 timeout=chunk_timeout_s,
@@ -423,6 +442,32 @@ class EBadge:
 
 
 async def _find_device(address_or_name: str, timeout: float) -> BLEDevice | None:
+    # Connected BlueZ devices may stop advertising.
+
+    import sys
+    if sys.platform == "linux":
+        from dbus_fast.aio import MessageBus
+        from dbus_fast import BusType, Message, MessageType
+        bus = None
+        try:
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            reply = await bus.call(Message(
+                destination="org.bluez", path="/",
+                interface="org.freedesktop.DBus.ObjectManager", member="GetManagedObjects",
+            ))
+            if reply.message_type != MessageType.ERROR:
+                for path, interfaces in reply.body[0].items():
+                    values = interfaces.get("org.bluez.Device1")
+                    if not values:
+                        continue
+                    props = {k: v.value for k, v in values.items()}
+                    if props.get("Address", "").lower() == address_or_name.lower():
+                        return BLEDevice(props["Address"], props.get("Name"), {"path": path, "props": props})
+        except (OSError, EOFError) as exc:
+            log.debug("BlueZ cache lookup unavailable, falling back to scanning: %s", exc)
+        finally:
+            if bus is not None:
+                bus.disconnect()
     try:
         device = await BleakScanner.find_device_by_address(address_or_name, timeout=timeout)
         if device is not None:

@@ -1,5 +1,27 @@
 # ebadge
 
+## BG02 verificado: LJ733_MB_V1.5 / V35922 (JPEG)
+
+Se confirmó la subida desde Linux con un BG02 de 240×240, firmware de fábrica
+`V35922`, usando un payload JPEG con prefijo de longitud. El badge devolvió el
+estado de éxito y su propietario confirmó la imagen en pantalla. Para este
+perfil, usa explícitamente `--format jpeg`; el formato por defecto sigue siendo
+RU50 para conservar el comportamiento existente.
+
+```bash
+uv run python main.py upload-dial <MAC> foto.jpg --format jpeg
+```
+
+Desconecta primero el Bluetooth del teléfono. El perfil JPEG usa bloques de
+5000 bytes, secuencias desde 1, checksums de 32 bits y respuestas DC a las
+notificaciones CD. También se resuelven direcciones conocidas desde la caché
+de BlueZ cuando el dispositivo conectado deja de anunciarse.
+
+Los detalles del protocolo, vectores de la captura y límites de la validación
+están en [docs/bg02-jpeg-profile.md](docs/bg02-jpeg-profile.md). Esta prueba no
+demuestra compatibilidad con otras placas, firmwares o modelos de 360×360.
+
+
 Habla directo por BLE con un pin LCD BG02/BW03 (familia "DG01", app SuperBand/FitPro),
 sin pasar por el celular. Es un port a Python (`bleak`, corre nativo en Windows) del
 protocolo que documentó/reversó el proyecto

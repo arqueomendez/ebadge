@@ -6,7 +6,7 @@ import asyncio
 import logging
 import sys
 
-from . import ble, image, ru50
+from . import ble, image, ru50, jpeg
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_dims = sub.add_parser("dial-dims", help="query the badge's screen resolution", parents=[common])
     p_dims.add_argument("device", help="BLE address (Windows: e.g. AA:BB:CC:DD:EE:FF) or a substring of its advertised name")
 
-    p_upload = sub.add_parser("upload-dial", help="convert an image (RU50/ETC2 by default, or raw RGB565) and upload it as the dial face", parents=[common])
+    p_upload = sub.add_parser("upload-dial", help="convert an image and upload it as the dial face (JPEG profile available via --format jpeg)", parents=[common])
     p_upload.add_argument("device", help="BLE address or name substring")
     p_upload.add_argument("image", nargs="?", help="path to a JPG/PNG/etc image to upload (omit if using --solid)")
     p_upload.add_argument(
@@ -44,9 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_upload.add_argument("--fit", choices=["cover", "contain", "stretch"], default="cover")
     p_upload.add_argument(
         "--format",
-        choices=["ru50", "etc2-nopack", "rgb565"],
+        choices=["jpeg", "ru50", "etc2-nopack", "rgb565"],
         default="ru50",
-        help="wire payload format. 'ru50' (default) builds the proprietary RU50/ETC2 container -- header "
+        help="jpeg selects the verified BG02/LJ733_MB_V1.5/V35922 profile (length-prefixed JPEG, u32 checksums). "
+        "Other formats retain legacy framing. Wire payload format. 'ru50' (default) builds the proprietary RU50/ETC2 container -- header "
         "field layout confirmed 2026-08-31 by disassembling the real vendor libjl_bmp_convert.so, but a "
         "real-hardware test with that corrected header still hung identically at finish, so this default "
         "is not yet proven to work. 'etc2-nopack' sends just the raw ETC2-compressed texture with NO RU50 "
@@ -61,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="use the older 8-byte (length+sum) finish checksum instead of the 4-byte sum-only format "
         "upstream now believes is correct -- debugging escape hatch only, not recommended",
     )
-    p_upload.add_argument("--chunk-size", type=int, default=ble.DEFAULT_CHUNK_SIZE)
+    p_upload.add_argument("--chunk-size", type=int, default=ble.DEFAULT_CHUNK_SIZE, help="legacy formats only; JPEG profile uses 5000-byte chunks")
     p_upload.add_argument("--retries", type=int, default=3, help="resend a chunk this many times if the badge goes quiet before giving up")
     p_upload.add_argument(
         "--fragment-size",
@@ -159,6 +160,11 @@ def _parse_rgb(spec: str) -> tuple[int, int, int]:
 
 
 def _encode_payload(args: argparse.Namespace, width: int, height: int) -> bytes:
+    if args.format == "jpeg":
+        payload = jpeg.encode(args.image, width, height, fit=args.fit,
+                              solid=_parse_rgb(args.solid) if args.solid else None)
+        print(f"encoded JPEG + length header: {len(payload)} bytes ({width}x{height})")
+        return payload
     if args.format == "ru50":
         zero_unknown = args.ru50_zero_unknown_fields
         suffix = ", header unknown-fields=zeroed (diagnostic)" if zero_unknown else ""
@@ -221,7 +227,8 @@ async def _cmd_upload_dial(args: argparse.Namespace) -> int:
             await asyncio.sleep(args.upload_attempt_delay)
         try:
             async with await ble.EBadge.connect(
-                args.device, fragment_size=args.fragment_size, fragment_gap_s=args.fragment_gap_ms / 1000
+                args.device, fragment_size=args.fragment_size, fragment_gap_s=args.fragment_gap_ms / 1000,
+                ack_notifications=args.format == "jpeg",
             ) as badge:
                 if width is None or height is None:
                     info = await badge.dial_dims()
@@ -248,6 +255,7 @@ async def _cmd_upload_dial(args: argparse.Namespace) -> int:
 
                 await badge.upload_dial(
                     payload,
+                    jpeg_profile=args.format == "jpeg",
                     chunk_size=args.chunk_size,
                     chunk_retries=args.retries,
                     chunk_timeout_s=args.chunk_timeout,
